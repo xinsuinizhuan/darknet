@@ -25,13 +25,16 @@
 #include "batchnorm_layer.h"
 #include "maxpool_layer.h"
 #include "reorg_layer.h"
+#include "reorg_old_layer.h"
 #include "avgpool_layer.h"
 #include "cost_layer.h"
 #include "softmax_layer.h"
 #include "dropout_layer.h"
 #include "route_layer.h"
 #include "shortcut_layer.h"
+#include "scale_channels_layer.h"
 #include "yolo_layer.h"
+#include "gaussian_yolo_layer.h"
 #include "upsample_layer.h"
 #include "parser.h"
 
@@ -200,6 +203,10 @@ char *get_layer_string(LAYER_TYPE a)
             return "detection";
         case REGION:
             return "region";
+        case YOLO:
+            return "yolo";
+        case GAUSSIAN_YOLO:
+            return "Gaussian_yolo";
         case DROPOUT:
             return "dropout";
         case CROP:
@@ -210,6 +217,10 @@ char *get_layer_string(LAYER_TYPE a)
             return "route";
         case SHORTCUT:
             return "shortcut";
+        case SCALE_CHANNELS:
+            return "scale_channels";
+        case SAM:
+            return "sam";
         case NORMALIZATION:
             return "normalization";
         case BATCHNORM:
@@ -317,6 +328,7 @@ void backward_network(network net, network_state state)
         }
         layer l = net.layers[i];
         if (l.stopbackward) break;
+        if (l.onlyforward) continue;
         l.backward(l, state);
     }
 }
@@ -507,6 +519,8 @@ int resize_network(network *net, int w, int h)
         }
         else if (l.type == CRNN) {
             resize_crnn_layer(&l, w, h);
+        }else if (l.type == CONV_LSTM) {
+            resize_conv_lstm_layer(&l, w, h);
         }else if(l.type == CROP){
             resize_crop_layer(&l, w, h);
         }else if(l.type == MAXPOOL){
@@ -515,14 +529,20 @@ int resize_network(network *net, int w, int h)
             resize_region_layer(&l, w, h);
         }else if (l.type == YOLO) {
             resize_yolo_layer(&l, w, h);
+        }else if (l.type == GAUSSIAN_YOLO) {
+            resize_gaussian_yolo_layer(&l, w, h);
         }else if(l.type == ROUTE){
             resize_route_layer(&l, net);
         }else if (l.type == SHORTCUT) {
             resize_shortcut_layer(&l, w, h);
+        //}else if (l.type == SCALE_CHANNELS) {
+        //    resize_scale_channels_layer(&l, w, h);
         }else if (l.type == UPSAMPLE) {
             resize_upsample_layer(&l, w, h);
         }else if(l.type == REORG){
             resize_reorg_layer(&l, w, h);
+        } else if (l.type == REORG_OLD) {
+            resize_reorg_old_layer(&l, w, h);
         }else if(l.type == AVGPOOL){
             resize_avgpool_layer(&l, w, h);
         }else if(l.type == NORMALIZATION){
@@ -674,6 +694,9 @@ int num_detections(network *net, float thresh)
         if (l.type == YOLO) {
             s += yolo_num_detections(l, thresh);
         }
+        if (l.type == GAUSSIAN_YOLO) {
+            s += gaussian_yolo_num_detections(l, thresh);
+        }
         if (l.type == DETECTION || l.type == REGION) {
             s += l.w*l.h*l.n;
         }
@@ -690,6 +713,8 @@ detection *make_network_boxes(network *net, float thresh, int *num)
     detection* dets = (detection*)calloc(nboxes, sizeof(detection));
     for (i = 0; i < nboxes; ++i) {
         dets[i].prob = (float*)calloc(l.classes, sizeof(float));
+        // tx,ty,tw,th uncertainty
+        dets[i].uc = (float*)calloc(4, sizeof(float)); // Gaussian_YOLOv3
         if (l.coords > 4) {
             dets[i].mask = (float*)calloc(l.coords - 4, sizeof(float));
         }
@@ -736,6 +761,10 @@ void fill_network_boxes(network *net, int w, int h, float thresh, float hier, in
                     prev_classes, l.classes);
             }
         }
+        if (l.type == GAUSSIAN_YOLO) {
+            int count = get_gaussian_yolo_detections(l, w, h, net->w, net->h, thresh, map, relative, dets, letter);
+            dets += count;
+        }
         if (l.type == REGION) {
             custom_get_region_detections(l, w, h, net->w, net->h, thresh, map, hier, relative, dets, letter);
             //get_region_detections(l, w, h, net->w, net->h, thresh, map, hier, relative, dets);
@@ -760,6 +789,7 @@ void free_detections(detection *dets, int n)
     int i;
     for (i = 0; i < n; ++i) {
         free(dets[i].prob);
+        if (dets[i].uc) free(dets[i].uc);
         if (dets[i].mask) free(dets[i].mask);
     }
     free(dets);
@@ -779,6 +809,7 @@ char *detection_to_json(detection *dets, int nboxes, int classes, char **names, 
     const float thresh = 0.005; // function get_network_boxes() has already filtred dets by actual threshold
 
     char *send_buf = (char *)calloc(1024, sizeof(char));
+    if (!send_buf) return 0;
     if (filename) {
         sprintf(send_buf, "{\n \"frame_id\":%lld, \n \"filename\":\"%s\", \n \"objects\": [ \n", frame_id, filename);
     }
@@ -796,6 +827,7 @@ char *detection_to_json(detection *dets, int nboxes, int classes, char **names, 
                 if (class_id != -1) strcat(send_buf, ", \n");
                 class_id = j;
                 char *buf = (char *)calloc(2048, sizeof(char));
+                if (!buf) return 0;
                 //sprintf(buf, "{\"image_id\":%d, \"category_id\":%d, \"bbox\":[%f, %f, %f, %f], \"score\":%f}",
                 //    image_id, j, dets[i].bbox.x, dets[i].bbox.y, dets[i].bbox.w, dets[i].bbox.h, dets[i].prob[j]);
 
@@ -806,7 +838,10 @@ char *detection_to_json(detection *dets, int nboxes, int classes, char **names, 
                 int buf_len = strlen(buf);
                 int total_len = send_buf_len + buf_len + 100;
                 send_buf = (char *)realloc(send_buf, total_len * sizeof(char));
-                if (!send_buf) return 0;// exit(-1);
+                if (!send_buf) {
+                    if (buf) free(buf);
+                    return 0;// exit(-1);
+                }
                 strcat(send_buf, buf);
                 free(buf);
             }
@@ -830,6 +865,24 @@ float *network_predict_image(network *net, image im)
     else {
         // Need to resize image to the desired size for the net
         image imr = resize_image(im, net->w, net->h);
+        p = network_predict(*net, imr.data);
+        free_image(imr);
+    }
+    return p;
+}
+
+float *network_predict_image_letterbox(network *net, image im)
+{
+    //image imr = letterbox_image(im, net->w, net->h);
+    float *p;
+    if (net->batch != 1) set_batch_network(net, 1);
+    if (im.w == net->w && im.h == net->h) {
+        // Input image is the same size as our net, predict on that image
+        p = network_predict(*net, im.data);
+    }
+    else {
+        // Need to resize image to the desired size for the net
+        image imr = letterbox_image(im, net->w, net->h);
         p = network_predict(*net, imr.data);
         free_image(imr);
     }
@@ -1002,6 +1055,10 @@ void fuse_conv_batchnorm(network net)
         if (l->type == CONVOLUTIONAL) {
             //printf(" Merges Convolutional-%d and batch_norm \n", j);
 
+            if (l->share_layer != NULL) {
+                l->batch_normalize = 0;
+            }
+
             if (l->batch_normalize) {
                 int f;
                 for (f = 0; f < l->n; ++f)
@@ -1019,6 +1076,7 @@ void fuse_conv_batchnorm(network net)
                     }
                 }
 
+                free_convolutional_batchnorm(l);
                 l->batch_normalize = 0;
 #ifdef GPU
                 if (gpu_index >= 0) {
@@ -1114,6 +1172,13 @@ void copy_weights_net(network net_train, network *net_map)
             copy_cudnn_descriptors(tmp_input_layer, net_map->layers[k].input_layer);
             copy_cudnn_descriptors(tmp_self_layer, net_map->layers[k].self_layer);
             copy_cudnn_descriptors(tmp_output_layer, net_map->layers[k].output_layer);
+        }
+        else if(l->input_layer) // for AntiAliasing
+        {
+            layer tmp_input_layer;
+            copy_cudnn_descriptors(*net_map->layers[k].input_layer, &tmp_input_layer);
+            net_map->layers[k].input_layer = net_train.layers[k].input_layer;
+            copy_cudnn_descriptors(tmp_input_layer, net_map->layers[k].input_layer);
         }
         net_map->layers[k].batch = 1;
         net_map->layers[k].steps = 1;

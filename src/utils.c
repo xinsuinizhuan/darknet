@@ -41,6 +41,7 @@ int *read_map(char *filename)
         map = (int*)realloc(map, n * sizeof(int));
         map[n-1] = atoi(str);
     }
+    if (file) fclose(file);
     return map;
 }
 
@@ -65,6 +66,7 @@ void shuffle(void *arr, size_t n, size_t size)
         memcpy((char*)arr+(j*size), (char*)arr+(i*size), size);
         memcpy((char*)arr+(i*size), swp,          size);
     }
+    free(swp);
 }
 
 void del_arg(int argc, char **argv, int index)
@@ -216,7 +218,7 @@ void find_replace_extension(char *str, char *orig, char *rep, char *output)
     int offset = (p - buffer);
     int chars_from_end = strlen(buffer) - offset;
     if (!p || chars_from_end != strlen(orig)) {  // Is 'orig' even in 'str' AND is 'orig' found at the end of 'str'?
-        sprintf(output, "%s", str);
+        sprintf(output, "%s", buffer);
         free(buffer);
         return;
     }
@@ -621,6 +623,19 @@ float mag_array(float *a, int n)
     return sqrt(sum);
 }
 
+// indicies to skip is a bit array
+float mag_array_skip(float *a, int n, int * indices_to_skip)
+{
+    int i;
+    float sum = 0;
+    for (i = 0; i < n; ++i) {
+        if (indices_to_skip[i] != 1) {
+            sum += a[i] * a[i];
+        }
+    }
+    return sqrt(sum);
+}
+
 void scale_array(float *a, int n, float s)
 {
     int i;
@@ -672,9 +687,9 @@ int max_index(float *a, int n)
 
 int top_max_index(float *a, int n, int k)
 {
+    if (n <= 0) return -1;
     float *values = (float*)calloc(k, sizeof(float));
     int *indexes = (int*)calloc(k, sizeof(int));
-    if (n <= 0) return -1;
     int i, j;
     for (i = 0; i < n; ++i) {
         for (j = 0; j < k; ++j) {

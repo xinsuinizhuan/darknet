@@ -1,7 +1,7 @@
 #include "darknet.h"
-#include "cuda_runtime.h"
-#include "curand.h"
-#include "cublas_v2.h"
+#include <cuda_runtime.h>
+#include <curand.h>
+#include <cublas_v2.h>
 
 #include "activations.h"
 #include "dark_cuda.h"
@@ -186,6 +186,30 @@ __global__ void activate_array_kernel(float *x, int n, ACTIVATION a)
     if(i < n) x[i] = activate_kernel(x[i], a);
 }
 
+
+
+__global__ void activate_array_swish_kernel(float *x, int n, float *output_sigmoid_gpu, float *output_gpu)
+{
+    int i = (blockIdx.x + blockIdx.y*gridDim.x) * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float x_val = x[i];
+        float sigmoid = logistic_activate_kernel(x_val);
+        output_sigmoid_gpu[i] = sigmoid;
+        output_gpu[i] = x_val * sigmoid;
+    }
+}
+
+// https://github.com/digantamisra98/Mish
+__global__ void activate_array_mish_kernel(float *x, int n, float *activation_input, float *output_gpu)
+{
+    int i = (blockIdx.x + blockIdx.y*gridDim.x) * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float x_val = x[i];
+        activation_input[i] = x_val;    // store value before activation
+        output_gpu[i] = x_val * tanh_activate_kernel(log(1 + expf(x_val)));
+    }
+}
+
 __global__ void activate_array_leaky_kernel(float *x, int n)
 {
     int index = blockIdx.x*blockDim.x + threadIdx.x;
@@ -238,6 +262,41 @@ __global__ void gradient_array_kernel(float *x, int n, ACTIVATION a, float *delt
 {
     int i = (blockIdx.x + blockIdx.y*gridDim.x) * blockDim.x + threadIdx.x;
     if(i < n) delta[i] *= gradient_kernel(x[i], a);
+}
+
+// https://github.com/BVLC/caffe/blob/04ab089db018a292ae48d51732dd6c66766b36b6/src/caffe/layers/swish_layer.cu#L28-L30
+__global__ void gradient_array_swish_kernel(float *x, int n, float *sigmoid_gpu, float *delta)
+{
+    int i = (blockIdx.x + blockIdx.y*gridDim.x) * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float swish = x[i];
+        delta[i] *= swish + sigmoid_gpu[i] * (1 - swish); // gradient_kernel(x[i], a);
+    }
+}
+
+// https://github.com/digantamisra98/Mish
+__global__ void gradient_array_mish_kernel(int n, float *activation_input_gpu, float *delta)
+{
+    int i = (blockIdx.x + blockIdx.y*gridDim.x) * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const float THRESHOLD = 20.0f;
+
+        // implementation from TensorFlow: https://github.com/tensorflow/addons/commit/093cdfa85d334cbe19a37624c33198f3140109ed
+        // implementation from Pytorch: https://github.com/thomasbrandon/mish-cuda/blob/master/csrc/mish.h#L26-L31
+        float inp = activation_input_gpu[i];
+        const float sp = (inp < THRESHOLD) ? log1p(exp(inp)) : inp;
+        const float grad_sp = 1 - exp(-sp);
+        const float tsp = tanh(sp);
+        const float grad_tsp = (1 - tsp*tsp) * grad_sp;
+        const float grad = inp * grad_tsp + tsp;
+        delta[i] *= grad;
+
+        //float x = activation_input[i];
+        //float d = 2 * expf(x) + expf(2 * x) + 2;
+        //float w = 4 * (x + 1) + 4 * expf(2 * x) + expf(3 * x) + expf(x)*(4 * x + 6);
+        //float derivative = expf(x) * w / (d * d);
+        //delta[i] *= derivative;
+    }
 }
 
 __global__ void gradient_array_leaky_kernel(float *x, int n, float *delta)
@@ -303,6 +362,20 @@ extern "C" void activate_array_ongpu(float *x, int n, ACTIVATION a)
     CHECK_CUDA(cudaPeekAtLastError());
 }
 
+extern "C" void activate_array_swish_ongpu(float *x, int n, float *output_sigmoid_gpu, float *output_gpu)
+{
+    const int num_blocks = get_number_of_blocks(n, BLOCK);
+    activate_array_swish_kernel << <cuda_gridsize(n), BLOCK, 0, get_cuda_stream() >> >(x, n, output_sigmoid_gpu, output_gpu);
+    CHECK_CUDA(cudaPeekAtLastError());
+}
+
+extern "C" void activate_array_mish_ongpu(float *x, int n, float *activation_input_gpu, float *output_gpu)
+{
+    const int num_blocks = get_number_of_blocks(n, BLOCK);
+    activate_array_mish_kernel << <cuda_gridsize(n), BLOCK, 0, get_cuda_stream() >> >(x, n, activation_input_gpu, output_gpu);
+    CHECK_CUDA(cudaPeekAtLastError());
+}
+
 extern "C" void gradient_array_ongpu(float *x, int n, ACTIVATION a, float *delta)
 {
     const int num_blocks = get_number_of_blocks(n, BLOCK);
@@ -315,5 +388,20 @@ extern "C" void gradient_array_ongpu(float *x, int n, ACTIVATION a, float *delta
     else if (a == SELU) gradient_array_selu_kernel << <num_blocks, BLOCK, 0, get_cuda_stream() >> >(x, n, delta);
     else
         gradient_array_kernel << <cuda_gridsize(n), BLOCK, 0, get_cuda_stream() >> > (x, n, a, delta);
+    CHECK_CUDA(cudaPeekAtLastError());
+}
+
+
+extern "C" void gradient_array_swish_ongpu(float *x, int n, float *sigmoid_gpu, float *delta)
+{
+    const int num_blocks = get_number_of_blocks(n, BLOCK);
+    gradient_array_swish_kernel << <cuda_gridsize(n), BLOCK, 0, get_cuda_stream() >> > (x, n, sigmoid_gpu, delta);
+    CHECK_CUDA(cudaPeekAtLastError());
+}
+
+extern "C" void gradient_array_mish_ongpu(int n, float *activation_input_gpu, float *delta)
+{
+    const int num_blocks = get_number_of_blocks(n, BLOCK);
+    gradient_array_mish_kernel << <cuda_gridsize(n), BLOCK, 0, get_cuda_stream() >> > (n, activation_input_gpu, delta);
     CHECK_CUDA(cudaPeekAtLastError());
 }

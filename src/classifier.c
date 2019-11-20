@@ -63,6 +63,9 @@ void train_classifier(char *datacfg, char *cfgfile, char *weightfile, int *gpus,
     char *label_list = option_find_str(options, "labels", "data/labels.list");
     char *train_list = option_find_str(options, "train", "data/train.list");
     int classes = option_find_int(options, "classes", 2);
+    int topk_data = option_find_int(options, "top", 5);
+    char topk_buff[10];
+    sprintf(topk_buff, "top%d", topk_data);
 
     char **labels = get_labels(label_list);
     list *plist = get_paths(train_list);
@@ -74,6 +77,7 @@ void train_classifier(char *datacfg, char *cfgfile, char *weightfile, int *gpus,
     load_args args = {0};
     args.w = net.w;
     args.h = net.h;
+    args.c = net.c;
     args.threads = 32;
     args.hierarchy = net.hierarchy;
 
@@ -134,14 +138,14 @@ void train_classifier(char *datacfg, char *cfgfile, char *weightfile, int *gpus,
 #else
         loss = train_network(net, train);
 #endif
-        if(avg_loss == -1) avg_loss = loss;
+        if(avg_loss == -1 || isnan(avg_loss) || isinf(avg_loss)) avg_loss = loss;
         avg_loss = avg_loss*.9 + loss*.1;
 
         i = get_current_batch(net);
 
         int calc_topk_for_each = iter_topk + 2 * train_images_num / (net.batch * net.subdivisions);  // calculate TOPk for each 2 Epochs
         calc_topk_for_each = fmax(calc_topk_for_each, net.burn_in);
-        calc_topk_for_each = fmax(calc_topk_for_each, 1000);
+        calc_topk_for_each = fmax(calc_topk_for_each, 100);
         if (i % 10 == 0) {
             if (calc_topk) {
                 fprintf(stderr, "\n (next TOP5 calculation at %d iterations) ", calc_topk_for_each);
@@ -157,14 +161,14 @@ void train_classifier(char *datacfg, char *cfgfile, char *weightfile, int *gpus,
         int draw_precision = 0;
         if (calc_topk && (i >= calc_topk_for_each || i == net.max_batches)) {
             iter_topk = i;
-            topk = validate_classifier_single(datacfg, cfgfile, weightfile, &net, 5); // calc TOP5
-            printf("\n accuracy TOP5 = %f \n", topk);
+            topk = validate_classifier_single(datacfg, cfgfile, weightfile, &net, topk_data); // calc TOP5
+            printf("\n accuracy %s = %f \n", topk_buff, topk);
             draw_precision = 1;
         }
 
         printf("%d, %.3f: %f, %f avg, %f rate, %lf seconds, %ld images\n", get_current_batch(net), (float)(*net.seen)/ train_images_num, loss, avg_loss, get_current_rate(net), sec(clock()-time), *net.seen);
 #ifdef OPENCV
-        draw_train_loss(img, img_size, avg_loss, max_img_loss, i, net.max_batches, topk, draw_precision, "top5", dont_show, mjpeg_port);
+        draw_train_loss(img, img_size, avg_loss, max_img_loss, i, net.max_batches, topk, draw_precision, topk_buff, dont_show, mjpeg_port);
 #endif  // OPENCV
 
         if (i >= (iter_save + 1000)) {
@@ -791,7 +795,8 @@ void predict_classifier(char *datacfg, char *cfgfile, char *weightfile, char *fi
             strtok(input, "\n");
         }
         image im = load_image_color(input, 0, 0);
-        image r = letterbox_image(im, net.w, net.h);
+        image resized = resize_min(im, net.w);
+        image r = crop_image(resized, (resized.w - net.w)/2, (resized.h - net.h)/2, net.w, net.h);
         //image r = resize_min(im, size);
         //resize_network(&net, r.w, r.h);
         printf("%d %d\n", r.w, r.h);
@@ -1283,4 +1288,6 @@ void run_classifier(int argc, char **argv)
     else if(0==strcmp(argv[2], "valid10")) validate_classifier_10(data, cfg, weights);
     else if(0==strcmp(argv[2], "validcrop")) validate_classifier_crop(data, cfg, weights);
     else if(0==strcmp(argv[2], "validfull")) validate_classifier_full(data, cfg, weights);
+
+    if (gpus && gpu_list && ngpus > 1) free(gpus);
 }
